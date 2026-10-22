@@ -12,6 +12,22 @@ import boto3
 from botocore.exceptions import ClientError
 from loguru import logger
 
+# config/.env를 여기서 먼저 읽음 → 이 파일을 import하는 모든 수집/ETL 스크립트에 환경변수 적용
+# (이미 설정된 환경변수는 덮어쓰지 않음)
+try:
+    from pathlib import Path
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / "config" / ".env", override=False)
+except ImportError:
+    pass
+
+
+def run_date() -> str:
+    """bronze/silver 날짜 폴더 이름.
+    .env 또는 환경변수에 RUN_DATE=YYYY-MM-DD가 있으면 그 날짜로 고정 (여러 날에 걸쳐 수집해도 한 폴더에 이어 저장)
+    없으면 오늘 날짜"""
+    return os.getenv("RUN_DATE") or datetime.now().strftime("%Y-%m-%d")
+
 def get_s3_client():
     return boto3.client(
         "s3",
@@ -24,9 +40,8 @@ BUCKET = os.getenv("S3_BUCKET")
 
 
 def bronze_key(source: str, filename: str) -> str:
-    """bronze zone 경로 생성 - 날짜 파티셔닝 포함"""
-    date = datetime.now().strftime("%Y-%m-%d")
-    return f"bronze/{source}/{date}/{filename}"
+    """bronze zone 경로 생성 - 날짜 파티셔닝 포함 (RUN_DATE 우선)"""
+    return f"bronze/{source}/{run_date()}/{filename}"
 
 
 def upload_json(data: Any, s3_key: str) -> bool:
@@ -65,6 +80,33 @@ def list_keys(prefix: str) -> list:
     return keys
 
 
+DATE_FOLDER_RE = __import__("re").compile(r"/(\d{4}-\d{2}-\d{2})/")
+
+
+def dated_keys(prefix: str, suffix: str = ".json") -> list:
+    """prefix 아래 파일 중 '원천 폴더별로 한 날짜'의 파일만 반환
+    - 원천 폴더(날짜 앞까지 경로)마다 RUN_DATE 폴더가 있으면 그 날짜, 없으면 가장 최신 날짜
+    - 예전 날짜 데이터가 섞이거나, 여러 날 수집분이 중복으로 읽히는 것을 막음"""
+    groups: dict = {}
+    for k in list_keys(prefix):
+        if not k.endswith(suffix):
+            continue
+        m = DATE_FOLDER_RE.search(k)
+        if not m:
+            continue
+        groups.setdefault(k[:m.start()], {}).setdefault(m.group(1), []).append(k)
+    rd = os.getenv("RUN_DATE")
+    out = []
+    for base, by_date in sorted(groups.items()):
+        date = rd if rd in by_date else max(by_date)
+        if rd and date != rd:
+            logger.warning(f"  {base}/ 에 RUN_DATE({rd}) 폴더가 없어 최신 {date} 사용")
+        if len(by_date) > 1:
+            logger.info(f"  {base}/ 날짜 {len(by_date)}개 중 {date} 사용 ({len(by_date[date])}개 파일)")
+        out += by_date[date]
+    return sorted(out)
+
+
 def download_json(s3_key: str) -> Any:
     """S3에서 JSON 다운로드"""
     try:
@@ -76,6 +118,5 @@ def download_json(s3_key: str) -> Any:
 
 
 def silver_key(category: str, filename: str) -> str:
-    """silver zone S3 키 생성"""
-    date = datetime.now().strftime("%Y-%m-%d")
-    return f"silver/{category}/{date}/{filename}"
+    """silver zone S3 키 생성 (RUN_DATE 우선)"""
+    return f"silver/{category}/{run_date()}/{filename}"

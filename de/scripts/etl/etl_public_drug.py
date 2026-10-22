@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent.parent / "config" / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils_s3 import list_keys, download_json, upload_json, silver_key
+from utils_s3 import list_keys, dated_keys, download_json, upload_json, silver_key
 
 # 공식 출처 정보
 SOURCE_META = {
@@ -109,7 +109,7 @@ def main():
     logger.info("[ETL 1] 공공데이터 의약품 API 정제 시작")
     logger.info("=" * 50)
 
-    keys = [k for k in list_keys("bronze/api/public_data/") if k.endswith(".json")]
+    keys = [k for k in dated_keys("bronze/api/public_data/") if k.endswith(".json")]
     logger.info(f"Bronze 파일: {len(keys)}개")
 
     all_items = {}

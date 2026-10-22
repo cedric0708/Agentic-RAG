@@ -1,6 +1,7 @@
 # 환경변수
 config/.env
 *.env
+*.env_for_members.txt
 
 # 임시 파일
 *.dump
