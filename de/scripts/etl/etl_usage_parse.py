@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent.parent / "config" / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils_s3 import list_keys, download_json, upload_json, silver_key
+from utils_s3 import list_keys, dated_keys, download_json, upload_json, silver_key
 
 
 # ── 정규식 패턴 ──────────────────────────────────────────────
@@ -294,7 +294,7 @@ def process_silver_drugs():
     total_failed = 0
 
     for prefix in prefixes:
-        keys = [k for k in list_keys(prefix) if k.endswith(".json")]
+        keys = [k for k in dated_keys(prefix) if k.endswith(".json")]
         logger.info(f"\n▶ {prefix}: {len(keys)}개 파일")
 
         for key in keys:

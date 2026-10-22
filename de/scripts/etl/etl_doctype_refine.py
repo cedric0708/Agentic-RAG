@@ -8,7 +8,17 @@
   dur_interaction → 유지
 
 출력: s3://bucket/silver/refined/
+
+수정 이력:
+  v2 (symptom):
+    - 문제: has_redflag를 무시하고 '|' 조각마다 넓은 키워드("위험", "심각한", "출혈", "[예방]", "[치료]" 등)로
+            redflag를 다시 나눔 → 예방법·치료 설명이 위험 신호로 분류됨, 질환마다 redflag 문서가 2개씩 생김
+    - 수정: etl_crawl.py(v4)가 정한 has_redflag를 그대로 사용 (True → symptom_redflag, 그 외 → symptom_info)
+    - 원천별 최신 날짜 폴더만 읽음 (예전 날짜 데이터가 섞이지 않게)
+    - 저장 파일명에 원천 이름을 붙임 (health_portal / health_kr_disease의 batch_0000 덮어쓰기 방지)
+    - --dry-run: 업로드 없이 건수만 출력
 """
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -18,7 +28,14 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent.parent / "config" / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils_s3 import list_keys, download_json, upload_json, silver_key
+from utils_s3 import list_keys, dated_keys, download_json, upload_json, silver_key
+
+DATE_RE = re.compile(r"/(\d{4}-\d{2}-\d{2})/")
+
+
+def latest_keys(prefix: str) -> list:
+    """원천별 최신(또는 RUN_DATE) 날짜 폴더의 .json 파일만 → utils_s3.dated_keys 사용"""
+    return dated_keys(prefix)
 
 
 def clean_text(text) -> str:
@@ -137,68 +154,27 @@ def split_drug_info(item: dict) -> list:
 
 def split_symptom(item: dict) -> list:
     """
-    symptom_disease 1건 → symptom_redflag / symptom_info
-    Red flag 키워드 포함 여부로 분류
+    symptom_disease 1건 → symptom_redflag 또는 symptom_info (1건 그대로)
+    분류는 etl_crawl.py(v4)가 정한 metadata.has_redflag를 따름
+      - True  : "병원/응급실에 가야 하는 경우" 문장만 모은 문서 → symptom_redflag
+      - 그 외 : 질환 설명 전체 → symptom_info (has_redflag가 없는 약학정보원 질병정보 포함)
     """
     text = item.get("text", "")
     meta = item.get("metadata", {})
     doc_id = item.get("doc_id", "")
+    if not clean_text(text):
+        return []
 
-    # sections에서 redflag 관련 섹션 분리
-    redflag_parts = []
-    info_parts = []
-
-    parts = text.split("|")
-    for part in parts:
-        part = clean_text(part)
-        if not part:
-            continue
-        if is_redflag(part) or any(
-            kw in part for kw in ["[치료]", "[진단]", "[예방]", "[합병증]"]
-        ):
-            redflag_parts.append(part)
-        else:
-            info_parts.append(part)
-
-    results = []
-
-    # symptom_info (일반 정보)
-    if info_parts:
-        results.append({
-            "doc_id":   f"{doc_id}_info",
-            "doc_type": "symptom_info",
-            "text":     " | ".join(info_parts),
-            "metadata": {
-                **meta,
-                "doc_type":      "symptom_info",
-                "parent_doc_id": doc_id,
-            }
-        })
-
-    # symptom_redflag (위험 증상)
-    if redflag_parts:
-        results.append({
-            "doc_id":   f"{doc_id}_redflag",
-            "doc_type": "symptom_redflag",
-            "text":     " | ".join(redflag_parts),
-            "metadata": {
-                **meta,
-                "doc_type":      "symptom_redflag",
-                "parent_doc_id": doc_id,
-                "is_redflag":    True,
-            }
-        })
-
-    # 분류 안 되면 symptom_info로
-    if not results:
-        results.append({
-            "doc_id":   f"{doc_id}_info",
-            "doc_type": "symptom_info",
-            "text":     text,
-            "metadata": {**meta, "doc_type": "symptom_info", "parent_doc_id": doc_id},
-        })
-
-    return results
+    doc_type = "symptom_redflag" if meta.get("has_redflag") is True else "symptom_info"
+    new_meta = {**meta, "doc_type": doc_type, "parent_doc_id": doc_id}
+    if doc_type == "symptom_redflag":
+        new_meta["is_redflag"] = True
+    return [{
+        "doc_id":   doc_id,        # etl_crawl에서 이미 _info / _redflag로 끝남
+        "doc_type": doc_type,
+        "text":     text,
+        "metadata": new_meta,
+    }]
 
 
 # ── 전체 처리 ────────────────────────────────────────────────
@@ -211,7 +187,7 @@ def process_drug_info() -> int:
     ]
     total = 0
     for prefix in prefixes:
-        keys = [k for k in list_keys(prefix) if k.endswith(".json")]
+        keys = [k for k in dated_keys(prefix) if k.endswith(".json")]
         logger.info(f"  {prefix}: {len(keys)}개 파일")
 
         for key in keys:
@@ -223,8 +199,8 @@ def process_drug_info() -> int:
                 for item in items:
                     refined_items.extend(split_drug_info(item))
 
-                # silver/refined/drugs/ 에 저장
-                filename = key.split("/")[-1]
+                # silver/refined/drugs/ 에 저장 (원천 이름을 붙여 public_drug / health_kr_drug의 batch_0000 덮어쓰기 방지)
+                filename = f"{prefix.rstrip('/').split('/')[-1]}_{key.split('/')[-1]}"
                 s_key = silver_key("refined/drugs", filename)
                 upload_json({
                     "count": len(refined_items),
@@ -239,16 +215,18 @@ def process_drug_info() -> int:
     return total
 
 
-def process_symptom() -> int:
-    logger.info("▶ [symptom_disease] 세분화 시작")
+def process_symptom(dry_run: bool = False) -> int:
+    logger.info("▶ [symptom_disease] 세분화 시작 (v2: has_redflag 기준)")
+    counts = {}
     prefixes = [
         "silver/symptoms/health_portal/",
         "silver/symptoms/health_kr_disease/",
     ]
     total = 0
     for prefix in prefixes:
-        keys = [k for k in list_keys(prefix) if k.endswith(".json")]
-        logger.info(f"  {prefix}: {len(keys)}개 파일")
+        keys = latest_keys(prefix)
+        source = prefix.rstrip("/").split("/")[-1]
+        logger.info(f"  {prefix}: {len(keys)}개 파일 (최신 날짜만)")
 
         for key in keys:
             try:
@@ -259,18 +237,22 @@ def process_symptom() -> int:
                 for item in items:
                     refined_items.extend(split_symptom(item))
 
-                filename = key.split("/")[-1]
-                s_key = silver_key("refined/symptoms", filename)
-                upload_json({
-                    "count": len(refined_items),
-                    "items": refined_items,
-                }, s_key)
+                for it in refined_items:
+                    counts[it["doc_type"]] = counts.get(it["doc_type"], 0) + 1
+
+                filename = f"{source}_{key.split('/')[-1]}"   # 원천끼리 batch_0000 덮어쓰기 방지
+                if not dry_run:
+                    s_key = silver_key("refined/symptoms", filename)
+                    upload_json({
+                        "count": len(refined_items),
+                        "items": refined_items,
+                    }, s_key)
                 total += len(refined_items)
 
             except Exception as e:
                 logger.error(f"  ❌ {key}: {str(e)[:80]}")
 
-    logger.info(f"  ✅ symptom 세분화 완료: {total}건")
+    logger.info(f"  ✅ symptom 세분화 완료: {total}건 {counts}" + (" (dry-run, 업로드 안 함)" if dry_run else ""))
     return total
 
 
@@ -288,7 +270,7 @@ def process_dur() -> int:
     ]
     total = 0
     for prefix in prefixes:
-        keys = [k for k in list_keys(prefix) if k.endswith(".json")]
+        keys = [k for k in dated_keys(prefix) if k.endswith(".json")]
         for key in keys:
             try:
                 data = download_json(key)
@@ -305,13 +287,24 @@ def process_dur() -> int:
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="S3에 올리지 않고 건수만 출력 (symptoms만 지원)")
+    ap.add_argument("--target", choices=["symptoms", "drugs", "all"], default="symptoms",
+                    help="symptoms(기본) / drugs(e약은요 → drug_efficacy 등) / all")
+    args = ap.parse_args()
+
     logger.info("=" * 50)
     logger.info("[ETL] doc_type 세분화 시작")
     logger.info("=" * 50)
 
     total = 0
-    # total += process_drug_info()
-    total += process_symptom()
+    if args.target in ("drugs", "all"):
+        if args.dry_run:
+            logger.warning("drugs는 --dry-run을 지원하지 않아 건너뜀")
+        else:
+            total += process_drug_info()
+    if args.target in ("symptoms", "all"):
+        total += process_symptom(dry_run=args.dry_run)
     # total += process_dur()
 
     logger.info("=" * 50)

@@ -1,0 +1,38 @@
+# 환경변수
+config/.env
+*.env
+
+# 임시 파일
+*.dump
+*.json.bak
+combination_ban_sample.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Airflow
+logs/
+airflow.db
+airflow.cfg
+
+# 체크 스크립트 (개발용)
+scripts/ingestion/check_*.py
+scripts/ingestion/site_structure/
