@@ -22,6 +22,12 @@ class AppConfig:
     chroma_score_weight: float = 5.0
     chroma_host: str = "localhost"
     chroma_port: int = 8000
+    use_de_vector: bool = True
+    use_de_graph: bool = True
+    de_fallback_legacy: bool = True
+    de_mock: bool = False
+    de_vector_score_weight: float = 8.0
+    de_retrieval_top_k_multiplier: int = 3
 
 
 def load_config() -> AppConfig:
@@ -43,4 +49,10 @@ def load_config() -> AppConfig:
         chroma_score_weight=float(os.getenv("CHROMA_SCORE_WEIGHT", "5.0")),
         chroma_host=os.getenv("CHROMA_HOST", "localhost"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
+        use_de_vector=os.getenv("USE_DE_VECTOR", "true").lower() in {"1", "true", "yes"},
+        use_de_graph=os.getenv("USE_DE_GRAPH", "true").lower() in {"1", "true", "yes"},
+        de_fallback_legacy=os.getenv("DE_FALLBACK_LEGACY", "true").lower() in {"1", "true", "yes"},
+        de_mock=os.getenv("DE_MOCK", "false").lower() in {"1", "true", "yes"},
+        de_vector_score_weight=float(os.getenv("DE_VECTOR_SCORE_WEIGHT", "8.0")),
+        de_retrieval_top_k_multiplier=int(os.getenv("DE_RETRIEVAL_TOP_K_MULTIPLIER", "3")),
     )

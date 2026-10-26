@@ -44,7 +44,7 @@ def main() -> None:
             print(f"\nAssistant: {welcome}\n")
             continue
 
-        bundle, reply, trace = send_message(bundle, user_text)
+        bundle, reply, trace, _sources = send_message(bundle, user_text)
 
         if trace and config.enable_agent_trace:
             print(f"\n--- [Debug] ---\n{trace}\n")

@@ -60,18 +60,23 @@ async def predict_symptom(request: Request, response: Response, body: ChatReques
 
         # 3. AI 에이전트를 통한 메시지 처리
         # (OpenAI gpt-4o-mini 모델을 사용하여 맥락 분석 및 답변 생성)
-        updated_bundle, assistant_response, debug_trace = send_message(current_bundle, user_msg)
+        updated_bundle, assistant_response, debug_trace, data_sources = send_message(
+            current_bundle, user_msg
+        )
         
         # 4. 상태 갱신 및 영속성 레이어에 저장
         SESSION_DB[session_key] = updated_bundle
         save_session_to_file(session_key, updated_bundle.session)
         
         # 5. 최종 응답 반환
-        return {
+        payload = {
             "role": "ai",
             "content": assistant_response,
-            "debug_trace": debug_trace
+            "debug_trace": debug_trace,
         }
+        if data_sources is not None:
+            payload["data_sources"] = data_sources
+        return payload
 
     except Exception as e:
         # 시스템 에러 발생 시 상세 로깅

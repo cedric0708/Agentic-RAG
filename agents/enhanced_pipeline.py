@@ -11,7 +11,9 @@ from agents.query_agent import analyze_user_input
 from agents.red_flag import detect_red_flags
 from agents.recommendation_agent import decide_recommendations
 from agents.reranker import rerank_results
-from agents.retriever import retrieve_symptom_context, retrieve_top_k
+from agents.integrations.context import build_de_context
+from agents.integrations.types import DataBackend, DataProvenance
+from agents.retriever import retrieve_candidates, retrieve_symptom_context
 from agents.safety import check_symptom_red_flags, evaluate_drug_safety
 from agents.validator import validate_decision
 
@@ -71,10 +73,9 @@ def _format_enhanced_response(
         lines.append(f"  ✘ {error}")
 
     lines.append("\n[주의]")
+    lines.append("- Retrieval/Safety 출처는 파이프라인 data_provenance 및 API data_sources 필드를 참고하세요.")
     if use_chroma:
-        lines.append("- Retrieval은 규칙 기반 + ChromaDB(medical_knowledge) 하이브리드입니다.")
-    else:
-        lines.append("- Retrieval은 JSON 규칙 기반만 사용했습니다.")
+        lines.append("- (legacy) ChromaDB hybrid 사용 가능.")
     lines.append("- 실제 복약 판단은 의사/약사 상담이 우선입니다.")
     return "\n".join(lines)
 
@@ -94,6 +95,8 @@ def run_enhanced_pipeline_core(
     top_k = top_k or cfg.top_k
     trace_steps: List[AgentStep] = []
     symptom_context: List[ChromaEvidence] = []
+    provenance = DataProvenance()
+    de_ctx = build_de_context(cfg)
 
     def emit(step: AgentStep) -> None:
         trace_steps.append(step)
@@ -129,6 +132,7 @@ def run_enhanced_pipeline_core(
             user_input, symptoms, user_text=context_text
         )
         emergency = build_emergency_response(user_input, global_safety)
+        de_ctx.close()
         return PipelineResult(
             user_input=user_input,
             trace_steps=trace_steps,
@@ -136,6 +140,7 @@ def run_enhanced_pipeline_core(
             validation=validate_decision(decide_recommendations([]), drugs),
             is_emergency=True,
             emergency_message=emergency,
+            data_provenance=provenance,
         )
 
     if cfg.use_chroma:
@@ -153,21 +158,34 @@ def run_enhanced_pipeline_core(
                 )
             )
 
-    retrieved = retrieve_top_k(
-        user_input,
-        drugs,
-        top_k=top_k,
-        use_chroma=cfg.use_chroma,
-        chroma_top_n=cfg.chroma_top_n,
-        chroma_weight=cfg.chroma_score_weight,
-        min_score=cfg.min_retrieval_score,
-    )
+    try:
+        retrieved, retrieval_backend, retrieval_notes = retrieve_candidates(
+            user_input,
+            drugs,
+            top_k=top_k,
+            config=cfg,
+            de_ctx=de_ctx,
+            user_text=context_text,
+            use_chroma=cfg.use_chroma,
+            chroma_top_n=cfg.chroma_top_n,
+            chroma_weight=cfg.chroma_score_weight,
+            min_score=cfg.min_retrieval_score,
+        )
+        provenance.retrieval = retrieval_backend
+        for note in retrieval_notes:
+            provenance.note(note)
+    finally:
+        pass
+
+    retrieval_label = provenance.retrieval.value
     emit(
         AgentStep(
             "Retrieval Agent",
-            f"후보 {len(retrieved)}개 검색 완료 ({'hybrid' if cfg.use_chroma else 'rule-only'})",
-            [
-                f"{item.drug.name_ko}: score={item.score:.1f}"
+            f"후보 {len(retrieved)}개 검색 완료 [source={retrieval_label}]",
+            retrieval_notes
+            + [
+                f"{item.drug.name_ko}: score={item.score:.1f}, src={item.retrieval_source}"
+                + (f", de={item.de_score:.2f}" if item.de_score is not None else "")
                 + (f", chroma={len(item.chroma_evidence)}" if item.chroma_evidence else "")
                 for item in retrieved
             ]
@@ -177,13 +195,27 @@ def run_enhanced_pipeline_core(
 
     _ = [evaluate_drug_safety(user_input, result.drug) for result in retrieved]
 
-    reranked = rerank_results(user_input, retrieved, drugs)
+    reranked = rerank_results(
+        user_input,
+        retrieved,
+        drugs,
+        graph_client=de_ctx.graph,
+        de_fallback_legacy=de_ctx.fallback_legacy,
+    )
+    for item in reranked:
+        for reason in item.rerank_reasons:
+            if reason.startswith("safety_backend="):
+                raw = reason.split("=", 1)[1].strip()
+                try:
+                    provenance.safety = DataBackend(raw)
+                except ValueError:
+                    provenance.note(f"unknown safety_backend={raw}")
     emit(
         AgentStep(
             "Reranker",
-            "관련도 + 안전성 기반 재정렬 완료",
+            f"관련도 + 안전성 재정렬 [safety_source={provenance.safety.value}]",
             [
-                f"{item.retrieval.drug.name_ko}: final={item.final_score:.1f}, risk={item.risk_level}"
+                f"{item.retrieval.drug.name_ko}: final={item.final_score:.1f}, risk={item.risk_level}, blocked={item.blocked}"
                 for item in reranked
             ]
             or ["재정렬할 후보 없음"],
@@ -202,12 +234,17 @@ def run_enhanced_pipeline_core(
         )
     )
 
+    provenance.note(
+        f"summary retrieval={provenance.retrieval.value} safety={provenance.safety.value}"
+    )
+    de_ctx.close()
     return PipelineResult(
         user_input=user_input,
         trace_steps=trace_steps,
         decision=decision,
         validation=validation,
         symptom_context=symptom_context,
+        data_provenance=provenance,
     )
 
 
