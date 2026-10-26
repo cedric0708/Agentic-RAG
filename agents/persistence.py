@@ -1,10 +1,11 @@
 import json
 import os
+from pathlib import Path
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict
 from agents.models import ConversationSession, UserInput, ConversationTurn, ConversationPhase
 
-SESSION_DIR = "Agentic-RAG/data/sessions"
+SESSION_DIR = Path(__file__).resolve().parent.parent / "data" / "sessions"
 
 def session_to_dict(session: ConversationSession) -> Dict[str, Any]:
     """ConversationSession 객체를 JSON 저장이 가능한 딕셔너리로 변환."""
@@ -38,8 +39,7 @@ def dict_to_session(d: Dict[str, Any]) -> ConversationSession:
 
 def save_session_to_file(user_id: str, session: ConversationSession):
     """유저 세션을 JSON 파일로 저장."""
-    if not os.path.exists(SESSION_DIR):
-        os.makedirs(SESSION_DIR)
+    os.makedirs(SESSION_DIR, exist_ok=True)
     
     file_path = os.path.join(SESSION_DIR, f"{user_id}.json")
     with open(file_path, "w", encoding="utf-8") as f:

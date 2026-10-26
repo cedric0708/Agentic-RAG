@@ -2,6 +2,7 @@
 config/.env
 *.env
 *.env_for_members.txt
+data/sessions/
 
 # 임시 파일
 *.dump

@@ -1,0 +1,7 @@
+# JSON 기반 로컬 웹 API 및 선택적 OpenAI 상담에 필요한 의존성.
+# Chroma/데이터 수집/학습 도구는 별도로 설치합니다.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-dotenv>=1,<2
+openai>=1.40,<3
+httpx>=0.28,<1

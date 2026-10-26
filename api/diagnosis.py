@@ -28,13 +28,14 @@ async def predict_symptom(request: Request, response: Response, body: ChatReques
     # 신규 유저인 경우 고유 ID 생성 및 쿠키 발급
     if not user_id:
         user_id = str(uuid.uuid4())
-        # 운영 환경(HTTPS) 및 크로스 도메인(Vercel-Render) 지원을 위한 보안 설정
+        # 로컬 HTTP 및 동일 출처 Vite proxy에서 사용하는 세션 쿠키
         response.set_cookie(
             key="user_id", 
             value=user_id, 
             max_age=3600*24*30, # 30일 유지
-            samesite="none",
-            secure=True
+            samesite="lax",
+            secure=False,
+            httponly=True
         )
     
     # 유저 ID와 채팅방 ID를 조합하여 고유 세션 키 생성
