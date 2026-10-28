@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agents.integrations.types import AssessOutcome, DataBackend
 
@@ -27,6 +27,33 @@ class DrugGraphClient(ABC):
     @abstractmethod
     def find_drug(self, query: str, limit: int = 5) -> List[dict]:
         ...
+
+    def check_status(self, item_seq: str) -> Dict[str, Any]:
+        """Neo4j 제품·성분 상태 (DISABLED/UNAVAILABLE 시 NOT_FOUND 형태)."""
+        return {
+            "item_seq": item_seq,
+            "status": "NOT_FOUND",
+            "drug": None,
+            "ingredients": [],
+        }
+
+    def check_interactions(
+        self,
+        current: List[str],
+        candidate: str,
+        *,
+        all_duplicates: bool = False,
+    ) -> List[dict]:
+        return []
+
+    def get_subgraph(
+        self,
+        current: List[str],
+        candidate: str,
+        *,
+        dur_only: bool = False,
+    ) -> Dict[str, Any]:
+        return {"nodes": [], "edges": []}
 
 
 class DisabledGraphClient(DrugGraphClient):
@@ -140,6 +167,57 @@ class LiveGraphClient(DrugGraphClient):
         except Exception:
             return []
 
+    def check_status(self, item_seq: str) -> Dict[str, Any]:
+        if not self._ensure():
+            return {
+                "item_seq": item_seq,
+                "status": "NOT_FOUND",
+                "drug": None,
+                "ingredients": [],
+            }
+        try:
+            return dict(self._graph.check_status(item_seq))
+        except Exception:
+            return {
+                "item_seq": item_seq,
+                "status": "NOT_FOUND",
+                "drug": None,
+                "ingredients": [],
+            }
+
+    def check_interactions(
+        self,
+        current: List[str],
+        candidate: str,
+        *,
+        all_duplicates: bool = False,
+    ) -> List[dict]:
+        if not self._ensure() or not current:
+            return []
+        try:
+            return list(
+                self._graph.check_interactions(
+                    current, candidate, all_duplicates=all_duplicates
+                )
+                or []
+            )
+        except Exception:
+            return []
+
+    def get_subgraph(
+        self,
+        current: List[str],
+        candidate: str,
+        *,
+        dur_only: bool = False,
+    ) -> Dict[str, Any]:
+        if not self._ensure():
+            return {"nodes": [], "edges": []}
+        try:
+            return dict(self._graph.get_subgraph(current, candidate, dur_only=dur_only))
+        except Exception:
+            return {"nodes": [], "edges": []}
+
     def close(self) -> None:
         if self._graph is not None:
             try:
@@ -158,12 +236,18 @@ class MockGraphClient(DrugGraphClient):
         ban_pairs: Optional[List[tuple[str, str]]] = None,
         find_drug_fn: Optional[Callable[[str, int], List[dict]]] = None,
         fixed_verdict: Optional[dict[str, str]] = None,
+        status_map: Optional[dict[str, str]] = None,
         fail: bool = False,
+        interaction_fn: Optional[
+            Callable[[List[str], str], List[dict]]
+        ] = None,
     ) -> None:
         self._ban_pairs = set(ban_pairs or [])
         self._find_drug_fn = find_drug_fn
         self._fixed_verdict = {k: v.upper() for k, v in (fixed_verdict or {}).items()}
+        self._status_map = status_map or {}
         self._fail = fail
+        self._interaction_fn = interaction_fn
 
     @property
     def backend(self) -> DataBackend:
@@ -218,12 +302,15 @@ class MockGraphClient(DrugGraphClient):
                         "type": "contraindication",
                         "level": "ban",
                         "message": "Mock 병용금기",
+                        "current_seq": cur,
+                        "candidate_code": "MOCK",
+                        "source": "mock",
                     }
                 )
 
         if pregnant:
             verdict = "BAN" if verdict != "BAN" else verdict
-            if verdict == "BAN" and not findings:
+            if verdict == "BAN" and not any(f.get("type") == "contraindication" for f in findings):
                 findings.append({"type": "restriction", "level": "ban", "message": "Mock 임부금기"})
 
         payload = {
@@ -245,3 +332,52 @@ class MockGraphClient(DrugGraphClient):
         if "활명" in q:
             return [{"item_seq": "195700020", "name": "활명수"}]
         return []
+
+    def check_status(self, item_seq: str) -> Dict[str, Any]:
+        st = self._status_map.get(item_seq, "CHECKABLE")
+        if st == "NOT_FOUND":
+            return {"item_seq": item_seq, "status": "NOT_FOUND", "drug": None, "ingredients": []}
+        if st == "UNKNOWN":
+            return {
+                "item_seq": item_seq,
+                "status": "UNKNOWN",
+                "drug": {"item_seq": item_seq, "name": f"Drug-{item_seq}"},
+                "ingredients": [],
+            }
+        return {
+            "item_seq": item_seq,
+            "status": "CHECKABLE",
+            "drug": {"item_seq": item_seq, "name": f"Drug-{item_seq}"},
+            "ingredients": [{"code": "D000001", "name_kor": "mock-ing", "in_dur": True}],
+        }
+
+    def check_interactions(self, current: List[str], candidate: str, *, all_duplicates: bool = False) -> List[dict]:
+        if self._interaction_fn:
+            return self._interaction_fn(current, candidate)
+        if not current:
+            return []
+        rows: List[dict] = []
+        for cur in current:
+            if (cur, candidate) in self._ban_pairs or (candidate, cur) in self._ban_pairs:
+                rows.append(
+                    {
+                        "type": "contraindication",
+                        "level": "ban",
+                        "message": "Mock 병용금기",
+                        "current_seq": cur,
+                        "candidate_code": "D000002",
+                        "current_code": "D000001",
+                        "source": "mock-dur",
+                        "source_url": "https://example.invalid/mock",
+                    }
+                )
+        return rows
+
+    def get_subgraph(
+        self,
+        current: List[str],
+        candidate: str,
+        *,
+        dur_only: bool = False,
+    ) -> Dict[str, Any]:
+        return {"nodes": [], "edges": []}

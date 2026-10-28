@@ -23,6 +23,7 @@ from agents.reasoning_trace import (
     compute_retrieval_data_sources,
     sanitize_trace_value,
 )
+from tests.isolation import reset_vector_e5_cache
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,12 @@ class ReasoningTracePipelineTests(unittest.TestCase):
     def setUpClass(cls):
         cls.drugs = load_drugs(ROOT / "data" / "drugs.json")
         cls.symptoms = load_symptoms(ROOT / "data" / "symptoms.json")
+
+    def setUp(self):
+        reset_vector_e5_cache()
+
+    def tearDown(self):
+        reset_vector_e5_cache()
 
     def _run(self, ui: UserInput, **cfg_kw):
         cfg = _cfg(use_chroma=False, enable_reasoning_trace=True, **cfg_kw)
@@ -160,7 +167,8 @@ class ReasoningTracePipelineTests(unittest.TestCase):
         )
         self.assertEqual(retrieved[0].catalog_match, "stub")
 
-    def test_fallback_pg_unavailable(self):
+    @patch("agents.integrations.vector_client.get_shared_e5_model")
+    def test_fallback_pg_unavailable(self, mock_get_e5):
         cfg = _cfg(
             use_de_vector=True,
             de_fallback_legacy=True,
@@ -169,14 +177,26 @@ class ReasoningTracePipelineTests(unittest.TestCase):
             de_mock=False,
         )
         ui = UserInput(symptoms=["두통"])
-        # Live will fail in CI — pipeline uses build_de_context not inject; rely on env
-        result = run_enhanced_pipeline_core(ui, self.drugs, self.symptoms, config=cfg, top_k=2)
+        ctx = DeIntegrationContext(
+            vector=UnavailableVectorClient(),
+            graph=MockGraphClient(),
+            fallback_legacy=True,
+            prefer_de=True,
+        )
+        with patch("agents.enhanced_pipeline.build_de_context", return_value=ctx):
+            result = run_enhanced_pipeline_core(
+                ui, self.drugs, self.symptoms, config=cfg, top_k=2
+            )
+        mock_get_e5.assert_not_called()
         retrieval = next(
             s for s in result.reasoning_trace["steps"] if s["step_id"] == "retrieval_agent"
         )
-        notes = retrieval["decision"].get("fallback_notes", [])
+        self.assertEqual(retrieval["data_sources"], ["legacy_json"])
         prov = result.reasoning_trace.get("data_provenance", {})
-        self.assertTrue(notes or prov.get("retrieval") in ("legacy_json", "unavailable", "postgresql", "mock"))
+        self.assertIn(
+            prov.get("retrieval"),
+            ("legacy_json", "unavailable", "postgresql", "mock"),
+        )
 
     def test_emergency_early_stop(self):
         result = run_enhanced_pipeline_core(
@@ -260,6 +280,12 @@ class ReasoningTracePatchRegressionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.drugs = load_drugs(ROOT / "data" / "drugs.json")
         cls.symptoms = load_symptoms(ROOT / "data" / "symptoms.json")
+
+    def setUp(self):
+        reset_vector_e5_cache()
+
+    def tearDown(self):
+        reset_vector_e5_cache()
 
     def test_hybrid_mock_data_sources_not_postgresql(self):
         ui = UserInput(symptoms=["소화불량"])
