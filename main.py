@@ -18,7 +18,7 @@ load_dotenv(PROJECT_ROOT / '.env')
 # 로컬 기본 실행에는 Docker/Chroma 서버가 필요하지 않습니다.
 os.environ.setdefault('USE_CHROMA', 'false')
 
-from api import diagnosis, user, medicines, pharmacies
+from api import diagnosis, user, medicines, pharmacies, interaction_graph
 from agents.loader import load_drugs, load_symptoms
 
 app = FastAPI(title="의약품 통합 헬스케어 서버")
@@ -47,6 +47,7 @@ app.include_router(diagnosis.router)
 app.include_router(user.router)
 app.include_router(medicines.router)
 app.include_router(pharmacies.router)
+app.include_router(interaction_graph.router)
 
 @app.get("/")
 def read_root():

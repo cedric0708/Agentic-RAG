@@ -46,7 +46,7 @@ def respond(user_message: str, history: list, bundle: ChatBundle | None):
         bundle, welcome = create_chat()
         return [{"role": "assistant", "content": welcome}], bundle, ""
 
-    bundle, reply, _trace = send_message(bundle, text)
+    bundle, reply, _trace, _sources, _reasoning = send_message(bundle, text)
     history = history + [
         {"role": "user", "content": text},
         {"role": "assistant", "content": reply},

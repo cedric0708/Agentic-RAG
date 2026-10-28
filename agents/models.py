@@ -73,6 +73,10 @@ class RetrievalResult:
     matched_symptoms: List[str] = field(default_factory=list)
     reasons: List[str] = field(default_factory=list)
     chroma_evidence: List[ChromaEvidence] = field(default_factory=list)
+    de_score: Optional[float] = None
+    retrieval_source: str = "legacy_json"
+    de_document_snippet: Optional[str] = None
+    catalog_match: str = "catalog"
 
 
 class ConversationPhase(str, Enum):
@@ -116,6 +120,8 @@ class PipelineResult:
     is_emergency: bool = False
     emergency_message: str = ""
     symptom_context: List[ChromaEvidence] = field(default_factory=list)
+    data_provenance: Optional[Any] = None
+    reasoning_trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -126,3 +132,5 @@ class ConversationResponse:
     session: ConversationSession
     phase: ConversationPhase
     debug_trace: Optional[str] = None
+    data_sources: Optional[Dict[str, Any]] = None
+    reasoning_trace: Optional[Dict[str, Any]] = None

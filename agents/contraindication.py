@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
+from agents.integrations.graph_client import DrugGraphClient
+from agents.integrations.safety_de import merge_assess_into_contraindication, run_neo4j_assess
+from agents.integrations.types import DataBackend
 from agents.models import Drug, UserInput
 from agents.safety import evaluate_drug_safety
 
@@ -19,6 +22,9 @@ class ContraindicationCheck:
     warnings: List[str] = field(default_factory=list)
     blocked: bool = False
     penalty: float = 0.0
+    safety_backend: str = DataBackend.LEGACY_JSON.value
+    neo4j_verdict: str | None = None
+    de_safety_verified: bool = True
 
 
 def _current_drug_lookup(drugs: List[Drug]) -> Dict[str, Drug]:
@@ -42,7 +48,14 @@ def _extract_current_ingredients(user_input: UserInput, drugs: List[Drug]) -> Se
     return ingredients
 
 
-def check_drug_contraindication(user_input: UserInput, candidate: Drug, all_drugs: List[Drug]) -> ContraindicationCheck:
+def check_drug_contraindication(
+    user_input: UserInput,
+    candidate: Drug,
+    all_drugs: List[Drug],
+    *,
+    graph_client: DrugGraphClient | None = None,
+    fallback_legacy: bool = True,
+) -> ContraindicationCheck:
     """후보 약 하나에 대해 병용금기/중복성분/사용자 상태 위험을 검사한다."""
 
     base_safety = evaluate_drug_safety(user_input, candidate)
@@ -91,6 +104,35 @@ def check_drug_contraindication(user_input: UserInput, candidate: Drug, all_drug
     else:
         risk_level = "low"
 
+    safety_backend = DataBackend.LEGACY_JSON
+    neo4j_verdict: str | None = None
+    de_safety_verified = True
+
+    if graph_client is not None and graph_client.backend != DataBackend.DISABLED:
+        assess_outcome = run_neo4j_assess(graph_client, user_input, candidate, all_drugs)
+        (
+            blocked,
+            penalty,
+            warnings,
+            risk_level,
+            merged_backend,
+            _notes,
+            de_safety_verified,
+        ) = merge_assess_into_contraindication(
+            blocked,
+            penalty,
+            warnings,
+            risk_level,
+            assess_outcome,
+            fallback_legacy=fallback_legacy,
+        )
+        if assess_outcome.payload:
+            neo4j_verdict = str(assess_outcome.payload.get("verdict") or "")
+        if merged_backend not in (DataBackend.LEGACY_JSON, DataBackend.DISABLED):
+            safety_backend = merged_backend
+        elif assess_outcome.attempted_neo4j and not assess_outcome.ok:
+            safety_backend = DataBackend.UNAVAILABLE
+
     return ContraindicationCheck(
         drug_id=candidate.drug_id,
         drug_name=candidate.name_ko,
@@ -98,6 +140,9 @@ def check_drug_contraindication(user_input: UserInput, candidate: Drug, all_drug
         warnings=warnings,
         blocked=blocked,
         penalty=penalty,
+        safety_backend=safety_backend.value,
+        neo4j_verdict=neo4j_verdict,
+        de_safety_verified=de_safety_verified,
     )
 
 

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from agents.models import ChromaEvidence, Drug, RetrievalResult, UserInput
+
+if TYPE_CHECKING:
+    from agents.config import AppConfig
+    from agents.integrations.context import DeIntegrationContext
+
+from agents.integrations.mapping import build_symptom_queries, drug_from_de_row
+from agents.integrations.types import DataBackend, VectorSearchOutcome
 
 
 def _normalize_text(text: str) -> str:
@@ -210,6 +217,140 @@ def retrieve_top_k(
 
     scored_results.sort(key=lambda item: item.score, reverse=True)
     return scored_results[:top_k]
+
+
+def _retrieve_from_postgresql(
+    user_input: UserInput,
+    drugs: List[Drug],
+    top_k: int,
+    *,
+    de_ctx: "DeIntegrationContext",
+    user_text: str,
+    de_vector_weight: float,
+    multiplier: int,
+) -> Tuple[List[RetrievalResult], VectorSearchOutcome]:
+    queries = build_symptom_queries(user_input, user_text)
+    outcome = de_ctx.vector.search_drugs(queries, top_k=max(top_k * multiplier, top_k))
+    if not outcome.ok or not outcome.rows:
+        return [], outcome
+
+    results: List[RetrievalResult] = []
+    for row in outcome.rows:
+        drug, match_kind = drug_from_de_row(row, drugs)
+        de_score = float(row.get("score") or 0.0)
+        rule = score_drug(user_input, drug)
+        total = de_score * de_vector_weight + rule.score * 0.25
+        reasons = [
+            f"PostgreSQL/pgvector score={de_score:.3f} (×{de_vector_weight})",
+            f"retrieval_source={outcome.backend.value}",
+        ]
+        if match_kind == "stub":
+            reasons.append("catalog 미매칭 stub — legacy 상세 정보 없음")
+        results.append(
+            RetrievalResult(
+                drug=drug,
+                score=total,
+                matched_symptoms=rule.matched_symptoms or list(user_input.symptoms),
+                reasons=reasons,
+                de_score=de_score,
+                retrieval_source=outcome.backend.value,
+                de_document_snippet=str(row.get("text") or "")[:200] or None,
+                catalog_match=match_kind,
+            )
+        )
+    results.sort(key=lambda r: r.score, reverse=True)
+    return results[:top_k], outcome
+
+
+def retrieve_candidates(
+    user_input: UserInput,
+    drugs: List[Drug],
+    top_k: int = 3,
+    *,
+    config: "AppConfig",
+    de_ctx: Optional["DeIntegrationContext"] = None,
+    user_text: str = "",
+    use_chroma: bool = True,
+    chroma_top_n: int = 10,
+    chroma_weight: float = 5.0,
+    min_score: float = 0.0,
+) -> Tuple[List[RetrievalResult], DataBackend, List[str]]:
+    """
+    DE PostgreSQL 우선 검색 + (실패 시) legacy JSON/Chroma fallback.
+    """
+    notes: List[str] = []
+    de_results: List[RetrievalResult] = []
+    retrieval_backend = DataBackend.LEGACY_JSON
+
+    use_vector = (
+        de_ctx is not None
+        and config.use_de_vector
+        and de_ctx.vector.backend != DataBackend.DISABLED
+    )
+
+    if use_vector:
+        de_results, outcome = _retrieve_from_postgresql(
+            user_input,
+            drugs,
+            top_k,
+            de_ctx=de_ctx,
+            user_text=user_text,
+            de_vector_weight=config.de_vector_score_weight,
+            multiplier=config.de_retrieval_top_k_multiplier,
+        )
+        if outcome.ok and de_results:
+            retrieval_backend = outcome.backend
+            notes.append(f"Retrieval: {outcome.backend.value} hits={len(de_results)}")
+        elif outcome.attempted_postgresql:
+            notes.append(
+                f"PostgreSQL 검색 실패({outcome.backend.value}): "
+                f"{(outcome.error or 'no rows')[:120]}"
+            )
+            if not config.de_fallback_legacy:
+                notes.append("DE_FALLBACK_LEGACY=false — legacy 검색 생략")
+                return [], DataBackend.UNAVAILABLE, notes
+
+    if de_results:
+        if not config.de_fallback_legacy:
+            return de_results, retrieval_backend, notes
+        legacy = retrieve_top_k(
+            user_input,
+            drugs,
+            top_k=top_k,
+            use_chroma=use_chroma and config.use_chroma,
+            chroma_top_n=chroma_top_n,
+            chroma_weight=chroma_weight,
+            min_score=min_score,
+        )
+        seen = {r.drug.drug_id for r in de_results}
+        merged = list(de_results)
+        for item in legacy:
+            if item.drug.drug_id in seen:
+                continue
+            item.retrieval_source = DataBackend.LEGACY_JSON.value
+            merged.append(item)
+            if len(merged) >= top_k:
+                break
+        if legacy:
+            retrieval_backend = DataBackend.HYBRID
+            notes.append(f"hybrid: DE {len(de_results)} + legacy 보충")
+        return merged[:top_k], retrieval_backend, notes
+
+    legacy_only = retrieve_top_k(
+        user_input,
+        drugs,
+        top_k=top_k,
+        use_chroma=use_chroma and config.use_chroma,
+        chroma_top_n=chroma_top_n,
+        chroma_weight=chroma_weight,
+        min_score=min_score,
+    )
+    if use_vector:
+        retrieval_backend = DataBackend.LEGACY_JSON
+        notes.append("Retrieval fallback=legacy_json (DE 미사용 또는 실패)")
+    for item in legacy_only:
+        item.retrieval_source = DataBackend.LEGACY_JSON.value
+    return legacy_only, retrieval_backend, notes
 
 
 def retrieve_symptom_context(
