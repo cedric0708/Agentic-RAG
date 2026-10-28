@@ -12,7 +12,18 @@ from agents.red_flag import detect_red_flags
 from agents.recommendation_agent import decide_recommendations
 from agents.reranker import rerank_results
 from agents.integrations.context import build_de_context
-from agents.integrations.types import DataBackend, DataProvenance
+from agents.integrations.types import DataBackend, DataProvenance, provenance_to_dict
+from agents.reasoning_trace import (
+    PipelineTraceBridge,
+    apply_safety_provenance,
+    compute_retrieval_data_sources,
+    legacy_messages_clarification,
+    legacy_messages_query,
+    recommendation_decision_trace,
+    reranker_evidence_from_results,
+    retrieval_evidence_from_results,
+    user_input_summary,
+)
 from agents.retriever import retrieve_candidates, retrieve_symptom_context
 from agents.safety import check_symptom_red_flags, evaluate_drug_safety
 from agents.validator import validate_decision
@@ -97,50 +108,125 @@ def run_enhanced_pipeline_core(
     symptom_context: List[ChromaEvidence] = []
     provenance = DataProvenance()
     de_ctx = build_de_context(cfg)
+    bridge = PipelineTraceBridge.create(cfg, trace_steps, on_step)
 
-    def emit(step: AgentStep) -> None:
-        trace_steps.append(step)
-        if on_step:
-            on_step(step)
+    def _finish(
+        *,
+        pipeline_status: str,
+        decision,
+        validation,
+        is_emergency: bool = False,
+        emergency_message: str = "",
+    ) -> PipelineResult:
+        provenance.note(
+            f"summary retrieval={provenance.retrieval.value} safety={provenance.safety.value}"
+        )
+        reasoning_dict = bridge.finalize(
+            pipeline_status=pipeline_status,
+            data_provenance=provenance_to_dict(provenance) or {},
+        )
+        de_ctx.close()
+        return PipelineResult(
+            user_input=user_input,
+            trace_steps=trace_steps,
+            decision=decision,
+            validation=validation,
+            is_emergency=is_emergency,
+            emergency_message=emergency_message,
+            symptom_context=symptom_context,
+            data_provenance=provenance,
+            reasoning_trace=reasoning_dict,
+        )
 
+    # --- Query Agent ---
     query_analysis = analyze_user_input(user_input, drugs, symptoms)
-    emit(AgentStep("Query Agent", "입력 분석 완료", query_analysis.messages))
+    q_status, q_messages = legacy_messages_query(query_analysis)
 
+    def _populate_query(t) -> None:
+        t.input_summary = user_input_summary(user_input)
+        if context_text.strip():
+            t.input_summary["context_text"] = context_text.strip()[:200]
+        t.decision = {
+            "detected_terms_count": len(query_analysis.detected_terms),
+            "unknown_terms": query_analysis.unknown_terms[:8],
+        }
+        t.data_sources = ["legacy_json"]
+        t.summary = "사용자 입력 및 증상·조건 분석 완료"
+        if query_analysis.unknown_terms:
+            t.warnings.append("일부 입력 용어가 catalog에서 확인되지 않음")
+
+    bridge.emit_step(
+        step_id="query_agent",
+        agent="Query Agent",
+        legacy_status=q_status,
+        legacy_messages=q_messages,
+        populate=_populate_query if bridge.enable_structured else None,
+    )
+
+    # --- Clarification Agent ---
     clarification = generate_clarifying_questions(user_input)
-    if clarification.needs_clarification:
-        emit(
-            AgentStep(
-                "Clarification Agent",
-                "추가 확인 필요",
-                [f"Q. {q}" for q in clarification.questions[:3]]
-                + [f"Reason: {r}" for r in clarification.reasons[:2]],
-            )
-        )
-    else:
-        emit(
-            AgentStep(
-                "Clarification Agent",
-                "추가 질문 불필요",
-                ["추천에 필요한 기본 정보가 입력되었습니다."],
-            )
-        )
+    c_status, c_messages = legacy_messages_clarification(clarification)
 
+    def _populate_clarification(t) -> None:
+        t.input_summary = user_input_summary(user_input)
+        t.decision = {
+            "needs_clarification": clarification.needs_clarification,
+            "questions": clarification.questions[:5],
+            "reasons": clarification.reasons[:5],
+        }
+        t.summary = c_status
+
+    bridge.emit_step(
+        step_id="clarification_agent",
+        agent="Clarification Agent",
+        legacy_status=c_status,
+        legacy_messages=c_messages,
+        populate=_populate_clarification if bridge.enable_structured else None,
+    )
+
+    # --- Safety Agent ---
     red_flag = detect_red_flags(user_input, symptoms, user_text=context_text)
-    emit(AgentStep("Safety Agent", "red flag 검사 완료", red_flag.reasons or [red_flag.action]))
+    safe_messages = [
+        f"red_flag={red_flag.has_red_flag}",
+        f"action={red_flag.action}",
+    ]
+    if red_flag.matched:
+        safe_messages.append(f"signals={', '.join(red_flag.matched[:5])}")
+
+    def _populate_safety(t) -> None:
+        t.input_summary = user_input_summary(user_input)
+        t.decision = {
+            "has_red_flag": red_flag.has_red_flag,
+            "matched_signals": red_flag.matched,
+            "action": red_flag.action,
+        }
+        t.data_sources = ["legacy_json"]
+        t.summary = "응급 red flag 검사 완료"
+        if red_flag.has_red_flag:
+            t.status = "warning"
+            t.warnings.append("응급 징후 가능 — 추천 파이프라인 조기 종료")
+
+    bridge.emit_step(
+        step_id="safety_agent",
+        agent="Safety Agent",
+        legacy_status="응급 red flag 검사 완료",
+        legacy_messages=safe_messages,
+        populate=_populate_safety if bridge.enable_structured else None,
+    )
+
     if red_flag.has_red_flag:
         global_safety = check_symptom_red_flags(
             user_input, symptoms, user_text=context_text
         )
         emergency = build_emergency_response(user_input, global_safety)
-        de_ctx.close()
-        return PipelineResult(
-            user_input=user_input,
-            trace_steps=trace_steps,
-            decision=decide_recommendations([]),
-            validation=validate_decision(decide_recommendations([]), drugs),
+        bridge.add_skipped_pipeline_tail("retrieval_agent")
+        empty_decision = decide_recommendations([])
+        return _finish(
+            pipeline_status="emergency_stop",
+            decision=empty_decision,
+            validation=validate_decision(empty_decision, drugs),
             is_emergency=True,
             emergency_message=emergency,
-            data_provenance=provenance,
         )
 
     if cfg.use_chroma:
@@ -149,52 +235,89 @@ def run_enhanced_pipeline_core(
             top_n=2,
             user_text=context_text,
         )
+        chroma_messages: List[str] = []
         if symptom_context:
-            emit(
-                AgentStep(
-                    "ChromaDB",
-                    "증상 참고 청크 검색",
-                    [f"{item.chunk_id}: {item.document[:80]}..." for item in symptom_context],
-                )
+            chroma_messages.append(f"Chroma hits={len(symptom_context)}")
+        else:
+            chroma_messages.append("ChromaDB 참고 청크 없음")
+
+        def _populate_chroma(t) -> None:
+            t.data_sources = ["chroma"]
+            if symptom_context:
+                t.decision = {"hits": len(symptom_context)}
+                t.evidence = [
+                    {"chunk_id": item.chunk_id, "relevance": round(item.relevance, 3)}
+                    for item in symptom_context[:3]
+                ]
+                t.summary = "증상 참고 청크 검색 완료"
+            else:
+                t.status = "skipped"
+                t.summary = "ChromaDB 참고 청크 없음"
+
+        bridge.emit_step(
+            step_id="chromadb",
+            agent="ChromaDB",
+            legacy_status="증상 참고 청크 검색",
+            legacy_messages=chroma_messages,
+            populate=_populate_chroma if bridge.enable_structured else None,
+        )
+
+    # --- Retrieval Agent ---
+    retrieved, retrieval_backend, retrieval_notes = retrieve_candidates(
+        user_input,
+        drugs,
+        top_k=top_k,
+        config=cfg,
+        de_ctx=de_ctx,
+        user_text=context_text,
+        use_chroma=cfg.use_chroma,
+        chroma_top_n=cfg.chroma_top_n,
+        chroma_weight=cfg.chroma_score_weight,
+        min_score=cfg.min_retrieval_score,
+    )
+    provenance.retrieval = retrieval_backend
+    hit_sources = compute_retrieval_data_sources(retrieved, retrieval_backend, retrieval_notes)
+    provenance.retrieval_hit_sources = list(hit_sources)
+    for note in retrieval_notes:
+        provenance.note(note)
+
+    ret_messages = [
+        f"후보 {len(retrieved)}개 검색 [run_backend={retrieval_backend.value}]",
+        f"hit_sources={','.join(hit_sources) if hit_sources else 'none'}",
+    ]
+    stub_count = sum(1 for r in retrieved if r.catalog_match == "stub")
+    if stub_count:
+        ret_messages.append(f"stub catalog 미매칭 후보 {stub_count}건")
+
+    def _populate_retrieval(t) -> None:
+        t.input_summary = user_input_summary(user_input)
+        t.decision = {
+            "retrieved_count": len(retrieved),
+            "backend": retrieval_backend.value,
+            "hit_sources": hit_sources,
+            "fallback_notes": retrieval_notes[:6],
+        }
+        t.evidence = retrieval_evidence_from_results(retrieved)
+        t.data_sources = list(hit_sources)
+        t.summary = f"후보 {len(retrieved)}개 검색 [source={retrieval_backend.value}]"
+        if stub_count:
+            t.warnings.append(
+                f"stub catalog 미매칭 후보 {stub_count}건 — 추천 전 추가 검증 필요"
             )
+        if any("fallback" in n.lower() or "실패" in n for n in retrieval_notes):
+            t.warnings.append("PostgreSQL 검색 실패 또는 fallback 발생 — legacy 출처 포함")
 
-    try:
-        retrieved, retrieval_backend, retrieval_notes = retrieve_candidates(
-            user_input,
-            drugs,
-            top_k=top_k,
-            config=cfg,
-            de_ctx=de_ctx,
-            user_text=context_text,
-            use_chroma=cfg.use_chroma,
-            chroma_top_n=cfg.chroma_top_n,
-            chroma_weight=cfg.chroma_score_weight,
-            min_score=cfg.min_retrieval_score,
-        )
-        provenance.retrieval = retrieval_backend
-        for note in retrieval_notes:
-            provenance.note(note)
-    finally:
-        pass
-
-    retrieval_label = provenance.retrieval.value
-    emit(
-        AgentStep(
-            "Retrieval Agent",
-            f"후보 {len(retrieved)}개 검색 완료 [source={retrieval_label}]",
-            retrieval_notes
-            + [
-                f"{item.drug.name_ko}: score={item.score:.1f}, src={item.retrieval_source}"
-                + (f", de={item.de_score:.2f}" if item.de_score is not None else "")
-                + (f", chroma={len(item.chroma_evidence)}" if item.chroma_evidence else "")
-                for item in retrieved
-            ]
-            or ["관련 후보 없음"],
-        )
+    bridge.emit_step(
+        step_id="retrieval_agent",
+        agent="Retrieval Agent",
+        legacy_status="검색 완료",
+        legacy_messages=ret_messages,
+        populate=_populate_retrieval if bridge.enable_structured else None,
     )
 
     _ = [evaluate_drug_safety(user_input, result.drug) for result in retrieved]
 
+    # --- Reranker ---
     reranked = rerank_results(
         user_input,
         retrieved,
@@ -202,49 +325,97 @@ def run_enhanced_pipeline_core(
         graph_client=de_ctx.graph,
         de_fallback_legacy=de_ctx.fallback_legacy,
     )
-    for item in reranked:
-        for reason in item.rerank_reasons:
-            if reason.startswith("safety_backend="):
-                raw = reason.split("=", 1)[1].strip()
-                try:
-                    provenance.safety = DataBackend(raw)
-                except ValueError:
-                    provenance.note(f"unknown safety_backend={raw}")
-    emit(
-        AgentStep(
-            "Reranker",
-            f"관련도 + 안전성 재정렬 [safety_source={provenance.safety.value}]",
-            [
-                f"{item.retrieval.drug.name_ko}: final={item.final_score:.1f}, risk={item.risk_level}, blocked={item.blocked}"
-                for item in reranked
-            ]
-            or ["재정렬할 후보 없음"],
-        )
+    apply_safety_provenance(provenance, reranked)
+    safety_sources = list(provenance.safety_backends) or [provenance.safety.value]
+    rerank_messages = [
+        f"candidate_count={len(reranked)}",
+        f"safety_backends={','.join(safety_sources)}",
+    ]
+
+    def _populate_rerank(t) -> None:
+        t.decision = {
+            "candidate_count": len(reranked),
+            "safety_backend": provenance.safety.value,
+            "safety_backends": list(provenance.safety_backends),
+        }
+        t.evidence = reranker_evidence_from_results(reranked)
+        t.data_sources = list(dict.fromkeys(safety_sources + hit_sources))
+        t.summary = f"관련성·안전성 재정렬 (safety={provenance.safety.value})"
+        for ev in t.evidence:
+            v = ev.get("neo4j_verdict")
+            if v in ("UNKNOWN", "NOT_FOUND"):
+                t.warnings.append(
+                    f"{ev.get('drug_name')}: Neo4j {v} — 금기 확정 아님, 미확인/미발견"
+                )
+            if ev.get("needs_extra_verification"):
+                t.warnings.append(
+                    f"{ev.get('drug_name')}: 추가 검증 필요(stub 또는 Neo4j 미검증)"
+                )
+
+    bridge.emit_step(
+        step_id="reranker",
+        agent="Reranker",
+        legacy_status="재정렬 완료",
+        legacy_messages=rerank_messages,
+        populate=_populate_rerank if bridge.enable_structured else None,
     )
 
+    # --- Recommendation Agent ---
     decision = decide_recommendations(reranked, max_recommendations=top_k)
-    emit(AgentStep("Recommendation Agent", "추천/비추천 판단 완료", decision.messages))
+    rec_messages = list(decision.messages) if decision.messages else []
+    rec_messages.insert(
+        0,
+        f"추천 {len(decision.recommended)}건 / 제외 {len(decision.rejected)}건",
+    )
 
-    validation = validate_decision(decision, drugs)
-    emit(
-        AgentStep(
-            "Validator",
-            "출력 검증 완료" if validation.passed else "출력 검증 실패",
-            validation.checks[:4] + validation.errors[:4],
+    def _populate_rec(t) -> None:
+        t.decision = recommendation_decision_trace(decision)
+        t.summary = (
+            f"추천 {len(decision.recommended)}건 / 제외 {len(decision.rejected)}건"
         )
+        if not decision.recommended:
+            t.warnings.append("확정 추천 후보 없음 — stub·안전 미검증·차단 등 사유 가능")
+
+    bridge.emit_step(
+        step_id="recommendation_agent",
+        agent="Recommendation Agent",
+        legacy_status="추천 결정",
+        legacy_messages=rec_messages,
+        populate=_populate_rec if bridge.enable_structured else None,
     )
 
-    provenance.note(
-        f"summary retrieval={provenance.retrieval.value} safety={provenance.safety.value}"
+    # --- Validator ---
+    validation = validate_decision(decision, drugs)
+    val_messages = [
+        "출력 검증 완료" if validation.passed else "출력 검증 실패",
+    ]
+    val_messages.extend(validation.checks[:4])
+    for err in validation.errors[:4]:
+        val_messages.append(f"error: {err}")
+
+    def _populate_val(t) -> None:
+        t.decision = {
+            "passed": validation.passed,
+            "checks": validation.checks[:8],
+            "errors": validation.errors[:8],
+        }
+        t.summary = "출력 검증 완료" if validation.passed else "출력 검증 실패"
+        if not validation.passed:
+            t.status = "warning"
+            t.warnings.extend(validation.errors[:4])
+
+    bridge.emit_step(
+        step_id="validator",
+        agent="Validator",
+        legacy_status="검증 완료",
+        legacy_messages=val_messages,
+        populate=_populate_val if bridge.enable_structured else None,
     )
-    de_ctx.close()
-    return PipelineResult(
-        user_input=user_input,
-        trace_steps=trace_steps,
+
+    return _finish(
+        pipeline_status="completed",
         decision=decision,
         validation=validation,
-        symptom_context=symptom_context,
-        data_provenance=provenance,
     )
 
 
@@ -254,16 +425,23 @@ def run_enhanced_pipeline(
     symptoms: List[Symptom],
     top_k: int = 3,
     config: Optional[AppConfig] = None,
+    *,
+    context_text: str = "",
+    on_step: Optional[Callable[[AgentStep], None]] = None,
 ) -> str:
-    """기존 단답형 CLI용 문자열 응답 (하위 호환)."""
+    """파이프라인 실행 후 사람이 읽을 수 있는 텍스트 응답을 반환합니다."""
     cfg = config or load_config()
-    result = run_enhanced_pipeline_core(user_input, drugs, symptoms, top_k=top_k, config=cfg)
-
-    if result.is_emergency:
-        return format_agent_trace(result.trace_steps) + "\n\n" + result.emergency_message
-
+    result = run_enhanced_pipeline_core(
+        user_input,
+        drugs,
+        symptoms,
+        top_k=top_k,
+        config=cfg,
+        context_text=context_text,
+        on_step=on_step,
+    )
     return _format_enhanced_response(
-        result.user_input,
+        user_input,
         result.decision,
         result.validation,
         result.trace_steps,

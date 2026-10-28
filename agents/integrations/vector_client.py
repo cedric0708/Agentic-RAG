@@ -1,9 +1,94 @@
 from __future__ import annotations
 
+import os
+import threading
 from abc import ABC, abstractmethod
-from typing import List, Union
+from typing import Any, Callable, List, Optional, Union
 
 from agents.integrations.types import DataBackend, VectorSearchOutcome
+
+# DE vector_tools.MODEL_NAME 과 동일 (DE 파일 import 없이 상수만 맞춤)
+E5_MODEL_NAME = "intfloat/multilingual-e5-large"
+
+_e5_model_lock = threading.Lock()
+_e5_model: Any = None
+_e5_model_loader: Optional[Callable[[], Any]] = None
+
+
+def _default_e5_model_loader() -> Any:
+    """DE DrugVectorDB._embed()와 동일 device·모델명."""
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return SentenceTransformer(E5_MODEL_NAME, device=device)
+
+
+def get_shared_e5_model() -> Any:
+    """프로세스 단일 SentenceTransformer (lazy, thread-safe)."""
+    global _e5_model
+    if _e5_model is not None:
+        return _e5_model
+    with _e5_model_lock:
+        if _e5_model is not None:
+            return _e5_model
+        loader = _e5_model_loader or _default_e5_model_loader
+        model = loader()
+        _e5_model = model
+        return _e5_model
+
+
+def reset_shared_e5_model_cache() -> None:
+    """테스트 전용: 공유 모델 캐시 초기화."""
+    global _e5_model, _e5_model_loader
+    with _e5_model_lock:
+        _e5_model = None
+        _e5_model_loader = None
+
+
+def set_e5_model_loader_for_tests(loader: Optional[Callable[[], Any]]) -> None:
+    """테스트 전용: 모델 생성 함수 주입."""
+    global _e5_model_loader
+    with _e5_model_lock:
+        _e5_model_loader = loader
+
+
+def probe_postgresql_liveness(*, connect_timeout: Optional[int] = None) -> tuple[bool, str]:
+    """
+    임베딩/E5 없이 PostgreSQL + pgvector extension 존재만 확인 (읽기 전용).
+    credential은 로그에 포함하지 않음.
+    """
+    try:
+        import psycopg2
+    except ImportError:
+        return False, "psycopg2 not installed"
+
+    timeout = connect_timeout if connect_timeout is not None else int(
+        os.getenv("PG_CONNECT_TIMEOUT", "8")
+    )
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("PG_HOST", "localhost"),
+            port=int(os.getenv("PG_PORT", "5432")),
+            dbname=os.getenv("VECTOR_DB", "drug_rag"),
+            user=os.getenv("PG_USER", "airflow"),
+            password=os.getenv("PG_PASSWORD", "airflow"),
+            connect_timeout=timeout,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.execute(
+                    "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                )
+                row = cur.fetchone()
+                if not row:
+                    return False, "pgvector extension not found"
+                return True, f"connection ok, pgvector={row[0]}"
+        finally:
+            conn.close()
+    except Exception as exc:
+        return False, f"{type(exc).__name__}"
 
 
 class DrugVectorClient(ABC):
@@ -48,12 +133,11 @@ class LiveVectorClient(DrugVectorClient):
         if self._connect_error:
             return False
         try:
-            import os
-
             from agents.integrations.de_import import load_de_module
 
             mod = load_de_module("vector_tools")
             timeout = int(os.getenv("PG_CONNECT_TIMEOUT", "8"))
+            shared_model = get_shared_e5_model()
             self._db = mod.DrugVectorDB(
                 dsn={
                     "host": os.getenv("PG_HOST", "localhost"),
@@ -62,7 +146,8 @@ class LiveVectorClient(DrugVectorClient):
                     "user": os.getenv("PG_USER", "airflow"),
                     "password": os.getenv("PG_PASSWORD", "airflow"),
                     "connect_timeout": timeout,
-                }
+                },
+                model=shared_model,
             )
             return True
         except Exception as exc:

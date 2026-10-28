@@ -60,7 +60,7 @@ async def predict_symptom(request: Request, response: Response, body: ChatReques
 
         # 3. AI 에이전트를 통한 메시지 처리
         # (OpenAI gpt-4o-mini 모델을 사용하여 맥락 분석 및 답변 생성)
-        updated_bundle, assistant_response, debug_trace, data_sources = send_message(
+        updated_bundle, assistant_response, debug_trace, data_sources, reasoning_trace = send_message(
             current_bundle, user_msg
         )
         
@@ -76,6 +76,8 @@ async def predict_symptom(request: Request, response: Response, body: ChatReques
         }
         if data_sources is not None:
             payload["data_sources"] = data_sources
+        if reasoning_trace is not None:
+            payload["reasoning_trace"] = reasoning_trace
         return payload
 
     except Exception as e:

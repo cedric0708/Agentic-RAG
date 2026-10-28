@@ -42,6 +42,8 @@ class DataProvenance:
 
     retrieval: DataBackend = DataBackend.LEGACY_JSON
     safety: DataBackend = DataBackend.LEGACY_JSON
+    retrieval_hit_sources: List[str] = field(default_factory=list)
+    safety_backends: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
     def note(self, text: str) -> None:
@@ -53,8 +55,13 @@ def provenance_to_dict(provenance: Optional["DataProvenance"]) -> Optional[Dict[
     """API/로그용 직렬화 (비밀정보 없음)."""
     if provenance is None:
         return None
-    return {
+    out = {
         "retrieval": provenance.retrieval.value,
         "safety": provenance.safety.value,
         "notes": list(provenance.notes),
     }
+    if provenance.retrieval_hit_sources:
+        out["retrieval_hit_sources"] = list(provenance.retrieval_hit_sources)
+    if provenance.safety_backends:
+        out["safety_backends"] = list(provenance.safety_backends)
+    return out

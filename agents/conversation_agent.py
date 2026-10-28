@@ -147,15 +147,23 @@ class ConversationalAgent:
         *,
         debug_trace: Optional[str] = None,
         data_sources: Optional[dict] = None,
+        reasoning_trace: Optional[dict] = None,
     ) -> ConversationResponse:
         session.turns.append(ConversationTurn(role="assistant", content=message))
         trace = debug_trace
         sources = data_sources
+        rtrace = reasoning_trace
         if self._last_pipeline_result:
             if self.config.enable_agent_trace:
                 trace = format_agent_trace(self._last_pipeline_result.trace_steps)
             if sources is None and self._last_pipeline_result.data_provenance is not None:
                 sources = provenance_to_dict(self._last_pipeline_result.data_provenance)
+            if (
+                rtrace is None
+                and self.config.enable_reasoning_trace
+                and self._last_pipeline_result.reasoning_trace
+            ):
+                rtrace = self._last_pipeline_result.reasoning_trace
         self.trace_sink.end()
         return ConversationResponse(
             message=message,
@@ -163,6 +171,7 @@ class ConversationalAgent:
             phase=session.phase,
             debug_trace=trace if self.config.enable_agent_trace else None,
             data_sources=sources,
+            reasoning_trace=rtrace if self.config.enable_reasoning_trace else None,
         )
 
     def _apply_extraction(self, session: ConversationSession, message: str) -> SlotExtractionResult:
@@ -373,6 +382,11 @@ class ConversationalAgent:
             else None
         )
         data_sources = provenance_to_dict(result.data_provenance)
+        reasoning_trace = (
+            result.reasoning_trace
+            if self.config.enable_reasoning_trace
+            else None
+        )
         self.trace_sink.end()
         session.turns.append(ConversationTurn(role="assistant", content=message))
         return ConversationResponse(
@@ -381,6 +395,7 @@ class ConversationalAgent:
             phase=session.phase,
             debug_trace=debug_trace,
             data_sources=data_sources,
+            reasoning_trace=reasoning_trace,
         )
 
     def _handle_follow_up(self, session: ConversationSession, intent: UserIntent) -> str:

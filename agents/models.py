@@ -121,6 +121,7 @@ class PipelineResult:
     emergency_message: str = ""
     symptom_context: List[ChromaEvidence] = field(default_factory=list)
     data_provenance: Optional[Any] = None
+    reasoning_trace: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -132,3 +133,4 @@ class ConversationResponse:
     phase: ConversationPhase
     debug_trace: Optional[str] = None
     data_sources: Optional[Dict[str, Any]] = None
+    reasoning_trace: Optional[Dict[str, Any]] = None

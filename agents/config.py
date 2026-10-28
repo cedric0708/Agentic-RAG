@@ -16,6 +16,7 @@ class AppConfig:
     min_retrieval_score: float = 0.1
     clarification_min_symptoms: int = 1
     enable_agent_trace: bool = False
+    enable_reasoning_trace: bool = True
     show_reasoning: bool = True
     use_chroma: bool = True
     chroma_top_n: int = 10
@@ -43,6 +44,8 @@ def load_config() -> AppConfig:
         top_k=int(os.getenv("TOP_K", "3")),
         min_retrieval_score=float(os.getenv("MIN_RETRIEVAL_SCORE", "0.1")),
         enable_agent_trace=os.getenv("ENABLE_AGENT_TRACE", "false").lower() in {"1", "true", "yes"},
+        enable_reasoning_trace=os.getenv("ENABLE_REASONING_TRACE", "true").lower()
+        in {"1", "true", "yes"},
         show_reasoning=os.getenv("SHOW_REASONING", "true").lower() in {"1", "true", "yes"},
         use_chroma=os.getenv("USE_CHROMA", "true").lower() in {"1", "true", "yes"},
         chroma_top_n=int(os.getenv("CHROMA_TOP_N", "10")),

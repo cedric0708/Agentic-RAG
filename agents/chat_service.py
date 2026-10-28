@@ -44,14 +44,15 @@ def create_chat(config: Optional[AppConfig] = None) -> Tuple[ChatBundle, str]:
 
 def send_message(
     bundle: ChatBundle, user_message: str
-) -> Tuple[ChatBundle, str, Optional[str], Optional[dict]]:
-    """사용자 메시지 1건 처리 → (bundle, assistant 답변, debug_trace, data_sources)."""
+) -> Tuple[ChatBundle, str, Optional[str], Optional[dict], Optional[dict]]:
+    """사용자 메시지 1건 처리 → (bundle, reply, debug_trace, data_sources, reasoning_trace)."""
     response = bundle.agent.process_message(bundle.session, user_message)
     return (
         ChatBundle(agent=bundle.agent, session=response.session),
         response.message,
         response.debug_trace,
         response.data_sources,
+        response.reasoning_trace,
     )
 
 

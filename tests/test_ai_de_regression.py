@@ -297,6 +297,7 @@ class DiagnosisApiCompatibilityTests(unittest.TestCase):
                 "테스트 답변",
                 None,
                 {"retrieval": "legacy_json", "safety": "legacy_json", "notes": []},
+                None,
             )
             client = TestClient(app)
             resp = client.post(
